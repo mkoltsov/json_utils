@@ -18,10 +18,37 @@ logger = logging.getLogger('rca_extractor')
 # Function to check if a page is filled with data or just a template
 def is_template_page(soup):
     """
-    Check if the page is just a template without real data
-    Returns True if the page appears to be just a template
+    Check if the page is just a template without real data.
+    Returns True if all sections are either empty or contain template indicators
     """
-    # Check if sections are empty or contain placeholder text
+    key_sections = [
+        "Summary",
+        "Root Cause",
+        "Actions Taken",
+
+        "Lessons Learned",
+        "Planned Actions"
+    ]
+
+    for section in key_sections:
+        content = extract_section_data(soup, section)
+        # Return False if section has content and doesn't contain template indicators
+        if content and "Example:" in content:
+            return True
+
+    return False
+
+# Function to extract data from a specific section
+def extract_section_data(soup, section_name):
+    """
+    Extract text data from a specific section in the page by finding text between headers
+    """
+    logger.info(f"Attempting to extract section: {section_name}")
+
+    # First, get all text content with minimal processing
+    text_content = soup.get_text(separator='\n', strip=True)
+
+    # Define all possible section headers
     sections = [
         "Incident General Information",
         "Summary",
@@ -29,73 +56,47 @@ def is_template_page(soup):
         "Actions Taken",
         "Timeline of Events",
         "Lessons Learned",
-        "Planned Actions"
+        "Planned Actions",
+        "Details"
     ]
 
-    # If most sections are empty, it's likely a template
-    empty_sections = 0
+    try:
+        # Find the start of our target section
+        section_start = text_content.index(section_name)
 
-    for section in sections:
-        section_header = soup.find(string=re.compile(f"^{section}$", re.IGNORECASE))
-        if section_header:
-            # Get the content after this header
-            next_elements = []
-            current = section_header.parent.find_next_sibling()
+        # Find the start of the next section
+        next_section_pos = float('inf')
+        for section in sections:
+            if section == section_name:
+                continue
+            try:
+                pos = text_content.index(section, section_start + len(section_name))
+                next_section_pos = min(next_section_pos, pos)
+            except ValueError:
+                continue
 
-            # Find the next section or end of content
-            while current and not current.find(string=lambda text: any(s in text for s in sections) if text else False):
-                next_elements.append(current)
-                current = current.find_next_sibling()
+        # Extract text between current section and next section
+        if next_section_pos != float('inf'):
+            section_text = text_content[section_start + len(section_name):next_section_pos]
+        else:
+            section_text = text_content[section_start + len(section_name):]
 
-            # Check if content seems empty or has just placeholder text
-            content = ' '.join([e.get_text(strip=True) for e in next_elements if e])
-            if not content or "TLDR:" in content or "Example:" in content or len(content) < 50:
-                empty_sections += 1
+        # Clean up the extracted text
+        section_text = section_text.strip()
 
-    # If more than half of sections are empty, consider it a template
-    return empty_sections > len(sections) // 2
+        logger.info(f"Extracted {section_name} ({len(section_text)} chars): {section_text[:200]}...")
+        return section_text
 
-# Function to extract data from a specific section
-def extract_section_data(soup, section_name):
-    """
-    Extract text data from a specific section in the page
-    """
-    section_header = soup.find(string=re.compile(f"^{section_name}$", re.IGNORECASE))
-    if not section_header:
+    except ValueError:
+        logger.warning(f"Section not found: {section_name}")
         return ""
-
-    # Get the content after this header until the next section
-    section_content = []
-    current = section_header.parent.find_next_sibling()
-
-    # Find all sections to know when to stop
-    all_sections = [
-        "Incident General Information",
-        "Summary",
-        "Root Cause",
-        "Actions Taken",
-        "Timeline of Events",
-        "Lessons Learned",
-        "Planned Actions"
-    ]
-
-    # Collect content until next section or end of content
-    while current and not current.find(string=lambda text: any(s in text for s in all_sections) if text else False):
-        # Extract text and clean it
-        text = current.get_text(strip=True, separator=' ')
-        if text:
-            section_content.append(text)
-        current = current.find_next_sibling()
-
-    return ' '.join(section_content)
-
 # Function to extract incident number from page title or content
 def extract_incident_number(soup, page_title):
     """
     Extract the incident number from the page title or content
     """
     # First try to get from title using regex (INC-XXXX pattern)
-    match = re.search(r'(INC-\d+)', page_title)
+    match = re.search(r'((?:INC|PRE)-\d+)', page_title)
     if match:
         return match.group(1)
 
@@ -103,12 +104,12 @@ def extract_incident_number(soup, page_title):
     info_section = soup.find(string=re.compile("Incident General Information", re.IGNORECASE))
     if info_section:
         # Look for a table with incident number
-        table = info_section.find_next('table')
+        table = info_section.find_parent().find_next('table')
         if table:
-            incident_cell = table.find(string=re.compile("Incident #", re.IGNORECASE))
-            if incident_cell:
+            incident_row = table.find(string=re.compile("Incident #", re.IGNORECASE))
+            if incident_row:
                 # Get the next cell which should contain the incident number
-                row = incident_cell.find_parent('tr')
+                row = incident_row.find_parent('tr')
                 if row:
                     cells = row.find_all('td')
                     if len(cells) > 1:
@@ -123,122 +124,231 @@ def process_rca_page(confluence, page_id, processed_ids):
     Process a single RCA page, extract data and save to JSON
     """
     try:
-        # Skip if already processed
         if page_id in processed_ids:
             logger.info(f"Skipping already processed page {page_id}")
-            return True
+            return None
 
-        # Get page content
         page = confluence.get_page_by_id(page_id, expand='body.storage')
-        page_title = page['title']
+        page_title = page.get('title', 'Unknown Title')
         html_content = page['body']['storage']['value']
 
-        # Parse HTML
         soup = BeautifulSoup(html_content, 'html.parser')
 
-        # Check if this is an empty template
         if is_template_page(soup):
             logger.info(f"Skipping template page: {page_title}")
-            return False
+            return None
 
-        # Extract incident number
-        incident_number = extract_incident_number(soup, page_title)
-
-        # Extract data from each section
+        # Extract all sections
         rca_data = {
             "title": page_title,
             "page_id": page_id,
             "extraction_date": datetime.now().isoformat(),
-            "sections": {
-                "Incident General Information": extract_section_data(soup, "Incident General Information"),
-                "Summary": extract_section_data(soup, "Summary"),
-                "Root Cause": extract_section_data(soup, "Root Cause"),
-                "Actions Taken": extract_section_data(soup, "Actions Taken"),
-                "Timeline of Events": extract_section_data(soup, "Timeline of Events"),
-                "Lessons Learned": extract_section_data(soup, "Lessons Learned"),
-                "Planned Actions": extract_section_data(soup, "Planned Actions")
-            }
+            "sections": {}
         }
 
+        sections = {
+            "Incident General Information": extract_section_data(soup, "Incident General Information"),
+            "Summary": extract_section_data(soup, "Summary"),
+            "Root Cause": extract_section_data(soup, "Root Cause"),
+            "Actions Taken": extract_section_data(soup, "Actions Taken"),
+            "Timeline of Events": extract_section_data(soup, "Timeline of Events"),
+            "Lessons Learned": extract_section_data(soup, "Lessons Learned"),
+            "Planned Actions": extract_section_data(soup, "Planned Actions")
+        }
+
+        # Verify that at least Summary and Root Cause are present
+        if not sections["Summary"] or not sections["Root Cause"]:
+            logger.warning(f"Skipping page {page_id} - Missing Summary or Root Cause content")
+            return None
+
+        rca_data["sections"] = sections
+
+        # Log all section contents for verification
+        logger.info(f"Extracted content for page {page_id}:")
+        for section, content in sections.items():
+            logger.info(f"{section}: {len(content)} chars")
+            logger.info(f"Content preview: {content[:200]}...")
+
         # Save to JSON file
+        incident_number = extract_incident_number(soup, page_title)
         filename = f"{incident_number}.json"
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(rca_data, f, ensure_ascii=False, indent=4)
 
-        logger.info(f"Saved RCA data to {filename}")
-        return True
+        logger.info(f"Successfully saved RCA data to {filename}")
+        return page_id
 
     except Exception as e:
         logger.error(f"Error processing page {page_id}: {str(e)}")
-        return False
+        return None
+
+# Function to process child pages
+def process_child_pages(confluence, parent_id, processed_ids):
+    """
+    Process all child pages of a given parent page ID
+    """
+    try:
+        # Get all child pages using get_child_pages or get_child_id_list method
+        # The method varies based on the version of the Atlassian Python API
+        try:
+            # Try the get_child_id_list method first
+            child_ids = confluence.get_child_id_list(parent_id)
+            if not isinstance(child_ids, list):
+                raise AttributeError("get_child_id_list method returned non-list result")
+
+            logger.info(f"Found {len(child_ids)} child pages for parent {parent_id} using get_child_id_list")
+
+            # Process each child page by ID
+            newly_processed = []
+            for index, child_id in enumerate(child_ids):
+                logger.info(f"Processing child page {index+1}/{len(child_ids)}: ID {child_id}")
+
+                # Process the page
+                if process_rca_page(confluence, child_id, processed_ids):
+                    newly_processed.append(child_id)
+
+                # Recursively process children of this page
+                child_processed = process_child_pages(confluence, child_id, processed_ids)
+                newly_processed.extend(child_processed)
+
+            return newly_processed
+
+        except (AttributeError, TypeError) as e:
+            # Fall back to the content API endpoint directly
+            logger.info(f"get_child_id_list method not available, using direct API call: {str(e)}")
+
+            # Use the REST API directly to get child pages
+            url = f"{confluence.url}/rest/api/content/{parent_id}/child/page?expand=page"
+            response = confluence.get(url)
+
+            if not isinstance(response, dict) or 'results' not in response:
+                logger.error(f"Unexpected response format when retrieving child pages of {parent_id}")
+                return []
+
+            child_pages = response.get('results', [])
+            logger.info(f"Found {len(child_pages)} child pages for parent {parent_id} using direct API")
+
+            newly_processed = []
+
+            # Process each child page
+            for index, page in enumerate(child_pages):
+                # Ensure page has an id
+                if not isinstance(page, dict) or 'id' not in page:
+                    logger.error(f"Invalid page structure at index {index}: {type(page)}")
+                    continue
+
+                page_id = page['id']
+                page_title = page.get('title', 'Unknown')
+                logger.info(f"Processing child page {index+1}/{len(child_pages)}: {page_title} (ID: {page_id})")
+
+                # Process the page
+                if process_rca_page(confluence, page_id, processed_ids):
+                    newly_processed.append(page_id)
+
+                # Recursively process children of this page
+                child_processed = process_child_pages(confluence, page_id, processed_ids)
+                newly_processed.extend(child_processed)
+
+            return newly_processed
+
+    except Exception as e:
+        logger.error(f"Error processing child pages of {parent_id}: {str(e)}")
+        return []
+
+# Load configuration from config.json
+def load_config():
+    """
+    Load configuration from config.json file
+    """
+    try:
+        if not os.path.exists('config.json'):
+            logger.error("config.json file not found")
+            raise FileNotFoundError("config.json file not found")
+
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+
+        # Validate required configuration
+        required_keys = ['confluence_url', 'page_id']
+        for key in required_keys:
+            if key not in config:
+                logger.error(f"Missing required configuration key: {key}")
+                raise KeyError(f"Missing required configuration key: {key}")
+
+        return config
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in config.json")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading configuration: {str(e)}")
+        raise
 
 # Main function
 def main():
-    # Get credentials from environment variables
-    username = os.environ.get('OKTA_USER')
-    password = os.environ.get('OKTA_PASSWORD')
-
-    if not username or not password:
-        logger.error("Missing environment variables OKTA_USER or OKTA_PASSWORD")
-        return
-
-    # Confluence URL - replace with your actual Confluence URL
-    confluence_url = "https://your-instance.atlassian.net"
-
-    # Space key - replace with your actual space key
-    space_key = "RCA"  # or whatever your RCA space key is
-
-    # Connect to Confluence
     try:
-        confluence = Confluence(
-            url=confluence_url,
-            username=username,
-            password=password
-        )
+        # Load configuration
+        config = load_config()
+        confluence_url = config['confluence_url']
+        page_id = config['page_id']
 
-        logger.info("Successfully connected to Confluence")
+        # Get credentials from environment variables
+        username = os.environ.get('OKTA_USER')
+        password = os.environ.get('OKTA_PASSWORD')
 
-        # Load processed IDs from file if it exists
-        processed_ids = []
-        if os.path.exists('processed.json'):
-            with open('processed.json', 'r') as f:
-                processed_ids = json.load(f)
+        if not username or not password:
+            logger.error("Missing environment variables OKTA_USER or OKTA_PASSWORD")
+            return
 
-        # Get all pages in the space
-        all_pages = []
-        start = 0
-        limit = 100
+        # Connect to Confluence
+        try:
+            confluence = Confluence(
+                url=confluence_url,
+                username=username,
+                password=password
+            )
 
-        while True:
-            pages = confluence.get_all_pages_from_space(space_key, start=start, limit=limit)
-            if not pages:
-                break
-            all_pages.extend(pages)
-            start += limit
-            if len(pages) < limit:
-                break
+            logger.info(f"Successfully connected to Confluence at {confluence_url}")
+            logger.info(f"Using page ID: {page_id}")
 
-        logger.info(f"Found {len(all_pages)} pages in space {space_key}")
+            # Test connection and verify page access
+            try:
+                # Simple API call to verify connection and page access
+                page_info = confluence.get_page_by_id(page_id, expand='')
+                if not page_info:
+                    logger.error(f"Could not retrieve information for page {page_id}")
+                    return
+                logger.info(f"Successfully verified access to page: {page_info.get('title', page_id)}")
+            except Exception as e:
+                logger.error(f"Failed to verify page access: {str(e)}")
+                return
 
-        # Process each page
-        newly_processed = []
+            # Load processed IDs from file if it exists
+            processed_ids = []
+            if os.path.exists('processed.json'):
+                with open('processed.json', 'r') as f:
+                    processed_ids = json.load(f)
 
-        for page in all_pages:
-            page_id = page['id']
-
-            # Process the page
+            # Process the specified page first
+            newly_processed = []
             if process_rca_page(confluence, page_id, processed_ids):
                 newly_processed.append(page_id)
 
-        # Update processed IDs file
-        processed_ids.extend(newly_processed)
-        with open('processed.json', 'w') as f:
-            json.dump(processed_ids, f)
+            # Then process all child pages recursively
+            child_processed = process_child_pages(confluence, page_id, processed_ids)
+            newly_processed.extend(child_processed)
 
-        logger.info(f"Processed {len(newly_processed)} new pages")
+            # Update processed IDs file
+            processed_ids.extend(newly_processed)
+            with open('processed.json', 'w') as f:
+                json.dump(processed_ids, f)
+
+            logger.info(f"Processed {len(newly_processed)} new pages")
+
+        except Exception as e:
+            logger.error(f"Error connecting to Confluence: {str(e)}")
 
     except Exception as e:
-        logger.error(f"Error connecting to Confluence: {str(e)}")
+        logger.error(f"Fatal error: {str(e)}")
 
 if __name__ == "__main__":
     main()
