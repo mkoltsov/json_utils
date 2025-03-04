@@ -210,7 +210,7 @@ def main():
 
     selected_matches = select_best_documents(all_matches)
 
-    total_words = sum(match[4] for match in all_matches if match[:3] in selected_matches)
+    total_words = sum(match[4] for match in all_matches if match[:3] in [(m[0], m[1], m[2]) for m in selected_matches])
 
     print(f"Selected {len(selected_matches)} documents (Total words: {total_words})")
     print("----------------------------------------\n")
@@ -227,7 +227,9 @@ def main():
 
     print("\nSummary of selected documents:")
     print("----------------------------------------")
-    for filename, date_str, _ in selected_matches:
+    # Sort the selected_matches by filename before printing the summary
+    sorted_summary = sorted(selected_matches, key=lambda x: x[0])
+    for filename, date_str, _ in sorted_summary:
         print(f"Found in file: {filename}")
         print(f"  Date: {date_str}")
 
